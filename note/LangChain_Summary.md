@@ -68,6 +68,7 @@ prompt_value = template.invoke({"text": "Hello", "language": "中文"})
 # res = llm.invoke(prompt_value)
 ```
 
+
 ### (2) ChatPromptTemplate (聊天模版)
 **适用场景**：专为聊天模型（如 GPT-4）设计，包含 System、Human、AI 等多角色消息。
 
@@ -162,8 +163,6 @@ res = pipeline_prompt.invoke({
     "output": "2",
     "user_input": "3+3"
 })
-```
-
 ### (5) MessagesPlaceholder (消息占位符)
 **适用场景**：用于在 ChatPromptTemplate 中动态插入**消息列表**（如历史对话记录），而不是简单的字符串。这是实现**带记忆功能的聊天机器人**的关键组件。
 
@@ -402,3 +401,272 @@ res = document_chain.invoke({
 上述所有 Chain 的完整可运行代码（包含环境配置和调用示例）已整理在 `chains_learning.py` 文件中。
 - **脚本路径**: [chains_learning.py](chains_learning.py)
 - **运行方式**: `python chains_learning.py`
+
+---
+
+## 7. Memory 模块 (记忆)
+
+Memory 是 LangChain 中用于让 LLM "记住" 之前对话内容的组件。由于 LLM 本身是无状态的（Stateless），每次请求都是独立的，因此需要额外的机制来存储和回传历史上下文。
+
+### (1) 常见 Memory 类型
+
+| 类型 | 类名 | 作用 | 优点 | 缺点 |
+| :--- | :--- | :--- | :--- | :--- |
+| **全量记忆** | `ConversationBufferMemory` | 完整记录所有对话历史。 | 信息最完整，逻辑连贯。 | 随着对话变长，Token 消耗巨大，容易超出上下文窗口限制。 |
+| **窗口记忆** | `ConversationBufferWindowMemory` | 只保留最近 `k` 轮对话 (滑动窗口)。 | 有效控制 Token 消耗，防止溢出。 | 会丢失较早的对话细节，无法进行长跨度的指代。 |
+| **摘要记忆** | `ConversationSummaryMemory` | 利用 LLM 对历史对话进行实时摘要，保留核心信息。 | 适合超长对话，Token 占用相对稳定且较小。 | 需要额外的 LLM 调用来生成摘要，增加延迟和成本；摘要可能丢失细节。 |
+
+### (2) 两种使用方式
+
+#### A. 传统方式 (配合 LLMChain)
+将 Memory 对象直接传给 Chain。
+
+```python
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import LLMChain
+
+memory = ConversationBufferMemory(memory_key="chat_history")
+chain = LLMChain(llm=llm, prompt=prompt, memory=memory)
+```
+
+#### B. 现代方式 (LCEL + RunnableWithMessageHistory) 【推荐】
+LangChain v0.1+ 推荐的做法。不将 Memory 绑定在 Chain 内部，而是作为外部工具挂载。
+
+*   **核心组件**: `RunnableWithMessageHistory`
+*   **原理**: 自动根据 `session_id` 读取历史记录 -> 注入 Prompt -> 执行 Chain -> 保存新的一轮对话。
+
+```python
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+
+# 1. 定义获取历史记录的方法 (通常对接 Redis/SQL)
+store = {}
+def get_session_history(session_id: str):
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
+    return store[session_id]
+
+# 2. 包装 Chain
+chain_with_history = RunnableWithMessageHistory(
+    runnable, # 原有的 Chain
+    get_session_history,
+    input_messages_key="input",
+    history_messages_key="history" # 对应 Prompt 中的占位符
+)
+
+# 3. 调用
+chain_with_history.invoke(
+    {"input": "你好"},
+    config={"configurable": {"session_id": "user_1"}}
+)
+```
+
+---
+
+## 8. Tool 模块 (工具)
+
+Tool 是 Agent 的核心能力来源，允许 LLM 与外部世界（API、数据库、搜索引擎）进行交互。
+
+### (1) 定义工具的三种方式
+
+#### A. `@tool` 装饰器 (推荐用于简单函数)
+最简单的方式，直接装饰一个 Python 函数。LLM 会自动读取函数的名称、参数类型提示 (Type Hint) 和文档字符串 (Docstring) 来理解工具。
+
+```python
+from langchain_core.tools import tool
+
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply two integers together."""
+    return a * b
+
+# 查看生成的 JSON Schema
+# print(multiply.args) 
+```
+
+#### B. `StructuredTool` (推荐用于复杂参数)
+当函数的参数比较复杂，或者需要更严格的参数验证时，可以使用 `StructuredTool` 结合 Pydantic 模型。
+
+```python
+from langchain_core.tools import StructuredTool
+from langchain.pydantic_v1 import BaseModel, Field
+
+class SearchInput(BaseModel):
+    query: str = Field(description="The search query")
+    limit: int = Field(default=5, description="Max results")
+
+def search(query: str, limit: int = 5):
+    return f"Searching {query}..."
+
+search_tool = StructuredTool.from_function(
+    func=search,
+    name="custom_search",
+    description="Search tool",
+    args_schema=SearchInput
+)
+```
+
+#### C. 继承 `BaseTool` 类
+适用于需要维护状态或进行复杂初始化的工具（如数据库连接）。
+
+### (2) 如何调用工具
+
+#### A. 手动绑定与调用 (bind_tools)
+让模型知道工具有哪些，但不自动执行。模型会返回一个 `tool_calls` 消息，告诉你它想调用哪个工具。
+
+```python
+tools = [multiply]
+llm_with_tools = llm.bind_tools(tools)
+res = llm_with_tools.invoke("5 乘以 8 是多少？")
+# res.tool_calls -> [{'name': 'multiply', 'args': {'a': 5, 'b': 8}, ...}]
+```
+
+#### B. Agent 自动执行 (create_tool_calling_agent)
+使用 AgentExecutor 来自动处理 "模型思考 -> 调用工具 -> 获取结果 -> 模型生成回答" 的循环。
+
+```python
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+
+# 1. 创建 Agent
+agent = create_tool_calling_agent(llm, tools, prompt)
+
+# 2. 创建执行器
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+# 3. 执行
+agent_executor.invoke({"input": "北京天气如何？"})
+```
+
+---
+
+## 9. Agent 模块 (智能体)
+
+Agent 是 LangChain 的大脑，它使用 LLM 来决定采取什么行动（Action），执行该行动，观察结果（Observation），并重复此过程直到完成任务。
+
+### (1) Agent 的类型
+
+#### A. Tool Calling Agent (Function Calling Agent) 【推荐】
+*   **适用场景**: 使用 OpenAI (gpt-3.5/4) 等支持 Function Calling 的模型。
+*   **特点**: 结构化输出，极其稳定，不易出错。
+*   **原理**: 利用模型原生的 `tool_calls` 能力。
+
+#### B. ReAct Agent (Reasoning + Acting)
+*   **适用场景**: 通用 LLM (如 Llama 2, Claude 2)，或者需要显式展示推理过程。
+*   **特点**: 基于 "Thought -> Action -> Observation" 的循环。
+*   **缺点**: 对 Prompt 格式要求严格，有时会解析失败。
+
+### (2) Agent 的创建与使用
+
+#### 通用步骤
+1.  **定义工具 (Tools)**: 准备好 Agent 可以使用的工具列表。
+2.  **选择模型 (LLM)**: 初始化 ChatModel。
+3.  **构建 Prompt**: 包含必要的指令和占位符 (如 `{agent_scratchpad}`)。
+4.  **创建 Agent**: 使用 `create_tool_calling_agent` 或 `create_react_agent`。
+5.  **创建执行器 (AgentExecutor)**: 负责运行 Agent 的循环。
+
+#### 代码示例 (Tool Calling Agent)
+
+```python
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain import hub
+
+# 1. 准备工具
+tools = [multiply, search]
+
+# 2. 获取 Prompt (标准模板)
+prompt = hub.pull("hwchase17/openai-tools-agent")
+# 或者自定义 Prompt，必须包含 MessagesPlaceholder(variable_name="agent_scratchpad")
+
+# 3. 创建 Agent
+agent = create_tool_calling_agent(llm, tools, prompt)
+
+# 4. 创建 Executor
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+# 5. 执行 (自动多步推理)
+res = agent_executor.invoke({
+    "input": "先计算 5 * 5，然后查询这个数字相关的历史事件"
+})
+print(res["output"])
+```
+
+### (3) 单工具 vs 多工具
+*   **单工具**: 传入 `tools=[tool1]`。Agent 只能选择用或不用这个工具。
+*   **多工具**: 传入 `tools=[tool1, tool2, ...]`。Agent 会根据问题自动决策：
+    *   只用 tool1
+    *   只用 tool2
+    *   先用 tool1，拿到结果后再用 tool2 (链式调用)
+    *   并行调用 (部分 Agent 支持)
+
+
+---
+
+## 10. Retrieval 模块 (检索)
+
+Retrieval (检索) 是 RAG (检索增强生成) 的基石。它允许 LLM 访问训练数据之外的私有数据。
+
+### (1) 文档加载器 (Document Loaders)
+负责从不同数据源加载数据，并将其封装为 `Document` 对象。`Document` 包含 `page_content` (内容) 和 `metadata` (来源、页码等)。
+
+*   `TextLoader`: 加载简单文本 (.txt)
+*   `PyPDFLoader`: 加载 PDF
+*   `WebBaseLoader`: 加载网页
+*   `DirectoryLoader`: 加载整个文件夹
+
+### (2) 文档转换器 (Text Splitters)
+由于 LLM 有上下文窗口限制，需要将长文档切分为较小的 Chunks。
+
+*   `CharacterTextSplitter`: 简单按字符/分隔符切分。
+*   `RecursiveCharacterTextSplitter` (**推荐**): 智能递归切分。先按段落切，段落太长切句子，句子太长切单词。尽量保持语义完整性。
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+docs = splitter.create_documents([text])
+```
+
+### (3) 文本嵌入模型 (Embeddings)
+将文本转换为向量 (Vector/Embedding)。语义相似的文本在向量空间中距离更近。
+
+*   `OpenAIEmbeddings`: OpenAI 的嵌入模型 (text-embedding-3-small 等)。
+*   `HuggingFaceEmbeddings`: 使用开源模型 (本地运行)。
+
+### (4) 向量存储 (Vector Stores)
+用于存储和检索 Embedding 向量的数据库。
+
+*   `Chroma`: 轻量级，支持本地文件存储，适合开发测试。
+*   `FAISS`: Facebook 开源的高效向量检索库，适合大规模数据。
+*   `Pinecone/Milvus`: 生产级向量数据库服务。
+
+### (5) 检索器 (Retrievers)
+Retriever 是连接向量数据库和 Chain 的接口。它接收查询 (Query)，返回相关的 Document 列表。
+
+*   **基础检索**: `vectorstore.as_retriever()`
+*   **高级检索**:
+    *   `MultiQueryRetriever`: 自动生成多个版本的 Query 进行检索。
+    *   `ContextualCompressionRetriever`: 检索后对文档进行压缩/过滤，只返回相关片段。
+
+### (6) 完整 RAG 流程代码
+
+```python
+# 1. 加载 -> 切分 -> 向量化 -> 存储
+loader = TextLoader("data.txt")
+docs = loader.load()
+splitter = RecursiveCharacterTextSplitter(chunk_size=500)
+splits = splitter.split_documents(docs)
+vectorstore = Chroma.from_documents(documents=splits, embedding=OpenAIEmbeddings())
+
+# 2. 创建检索器
+retriever = vectorstore.as_retriever()
+
+# 3. 构建 RAG Chain
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+
+prompt = ChatPromptTemplate.from_template("基于上下文回答: {context} 问题: {input}")
+document_chain = create_stuff_documents_chain(llm, prompt)
+retrieval_chain = create_retrieval_chain(retriever, document_chain)
+
+# 4. 提问
+res = retrieval_chain.invoke({"input": "我的数据里说了什么？"})
+```

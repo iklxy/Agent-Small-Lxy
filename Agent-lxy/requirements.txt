@@ -1,0 +1,7 @@
+langchain
+langchain-community
+langchain-chroma
+langchain-ollama
+chromadb
+openai
+ipykernel
